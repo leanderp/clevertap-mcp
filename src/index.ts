@@ -8,7 +8,47 @@ import { profileTools } from "./tools/profiles.js";
 import { campaignTools } from "./tools/campaigns.js";
 import { reportTools } from "./tools/reports.js";
 import { genericTools } from "./tools/generic.js";
+import { formatError } from "./errors.js";
 // import { webTools, webSessions } from "./tools/web.js"; // TODO: next version
+
+// Tools that only read data. They are announced with readOnlyHint so MCP clients can
+// treat them differently from the ones that write. Write tools are left unannotated.
+const READ_ONLY_TOOLS = new Set([
+  "clevertap_get_events",
+  "clevertap_get_events_cursor",
+  "clevertap_get_event_count",
+  "clevertap_get_profile",
+  "clevertap_get_profiles_by_event",
+  "clevertap_get_profiles_cursor",
+  "clevertap_get_profile_count",
+  "clevertap_get_campaigns",
+  "clevertap_get_campaign_report",
+  "clevertap_get_message_report",
+  "clevertap_get_top_property_count",
+  "clevertap_get_event_trend",
+  "clevertap_get_dau",
+  "clevertap_get_uninstall_report",
+  "clevertap_get_real_time_counts",
+  "clevertap_poll",
+]);
+const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
+
+// Optional tuning. CLEVERTAP_TIMEOUT_MS bounds one HTTP request (default 40000);
+// CLEVERTAP_BUDGET_MS bounds a whole tool call, polling and paging included (default 50000).
+function envMs(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.error(`Ignoring ${name}: expected a positive number of milliseconds.`);
+    return undefined;
+  }
+  return value;
+}
+const tuning = {
+  timeoutMs: envMs("CLEVERTAP_TIMEOUT_MS"),
+  budgetMs: envMs("CLEVERTAP_BUDGET_MS"),
+};
 
 // --- Build projects map ---
 // CLEVERTAP_PROJECTS accepts a JSON array:
@@ -36,8 +76,16 @@ if (projectsEnv) {
       console.error(`Error: Every project entry must have name, account_id, and passcode.`);
       process.exit(1);
     }
+    if (!cfg.region) {
+      console.error(
+        `Warning: project "${cfg.name}" has no region and defaults to in1. Set "region" (in1, us1, eu1, sg1, aps3, mec1) to match the account.`
+      );
+    }
     const region = (cfg.region ?? "in1") as CleverTapRegion;
-    clients.set(cfg.name, new CleverTapClient({ accountId: cfg.account_id, passcode: cfg.passcode, region }));
+    clients.set(
+      cfg.name,
+      new CleverTapClient({ accountId: cfg.account_id, passcode: cfg.passcode, region, ...tuning })
+    );
     projectMeta.set(cfg.name, { accountId: cfg.account_id, region });
   }
 } else {
@@ -46,7 +94,12 @@ if (projectsEnv) {
   const passcode = process.env.CLEVERTAP_PASSCODE;
   const region = (process.env.CLEVERTAP_REGION ?? "in1") as CleverTapRegion;
   if (accountId && passcode) {
-    clients.set("default", new CleverTapClient({ accountId, passcode, region }));
+    if (!process.env.CLEVERTAP_REGION) {
+      console.error(
+        "Warning: CLEVERTAP_REGION is not set and defaults to in1. Set it (in1, us1, eu1, sg1, aps3, mec1) to match the account."
+      );
+    }
+    clients.set("default", new CleverTapClient({ accountId, passcode, region, ...tuning }));
     projectMeta.set("default", { accountId, region });
   }
   // If neither is set, fall through to the setup tool registration below.
@@ -192,8 +245,10 @@ if (clients.size === 0) {
       ),
   });
 
+  // Off by default once projects are configured: it takes a passcode as an argument and
+  // echoes it back, so it is only exposed when CLEVERTAP_ENABLE_CONFIGURE=1.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  server.tool(
+  if (process.env.CLEVERTAP_ENABLE_CONFIGURE === "1") server.tool(
     "clevertap_configure",
     "Add a new CleverTap project to this MCP server. Returns the updated CLEVERTAP_PROJECTS JSON to paste into your MCP settings — restart the server to apply.",
     setupSchema.shape as any,
@@ -248,8 +303,7 @@ if (clients.size === 0) {
         ),
     });
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    server.tool(tool.name, tool.description, extendedSchema.shape as any, async (args: unknown) => {
+    const callback = async (args: unknown) => {
       const { project: projectArg, ...toolArgs } = args as Record<string, unknown> & { project?: string };
       const projectName = projectArg ?? defaultProject;
       const client = clients.get(projectName);
@@ -267,13 +321,20 @@ if (clients.size === 0) {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
         return {
-          content: [{ type: "text" as const, text: `Error: ${message}` }],
+          content: [{ type: "text" as const, text: formatError(error) }],
           isError: true,
         };
       }
-    });
+    };
+
+    // McpServer.tool has several overloads; annotations go between the schema and the callback.
+    const register = server.tool.bind(server) as unknown as (...toolArgs: unknown[]) => unknown;
+    if (READ_ONLY_TOOLS.has(tool.name)) {
+      register(tool.name, tool.description, extendedSchema.shape, READ_ONLY_ANNOTATIONS, callback);
+    } else {
+      register(tool.name, tool.description, extendedSchema.shape, callback);
+    }
   }
 
   // ── Web (browser) tools — TODO: next version ──

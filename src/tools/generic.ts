@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { CleverTapClient } from "../client.js";
+import { CleverTapClient, isPartial, withPollHint } from "../client.js";
+import { CleverTapToolError } from "../errors.js";
 
 export const genericTools = [
   {
@@ -62,15 +63,18 @@ When the response has status "partial" and a req_id, use clevertap_poll with tha
         return client.post(path, body ?? {});
       };
 
+      // A "partial" answer means CleverTap is still computing: say how to finish it.
+      const withHint = (result: unknown): unknown =>
+        isPartial(result) ? withPollHint(path, result) : result;
+
       try {
-        return await tryRequest(method);
+        return withHint(await tryRequest(method));
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
         // On 405 Method Not Allowed, retry with the opposite method
-        if (msg.includes("405")) {
+        if (err instanceof CleverTapToolError && err.httpStatus === 405) {
           const fallback =
             method === "GET" ? "POST" : method === "POST" ? "GET" : method;
-          const result = await tryRequest(fallback as "GET" | "POST" | "DELETE");
+          const result = withHint(await tryRequest(fallback as "GET" | "POST" | "DELETE"));
           return {
             _note: `Original method ${method} returned 405. Retried with ${fallback} successfully.`,
             ...((result as object) ?? {}),
@@ -85,7 +89,7 @@ When the response has status "partial" and a req_id, use clevertap_poll with tha
     description: `Poll a CleverTap async result using a req_id returned from a previous "partial" response.
 Use this after clevertap_request returns { "status": "partial", "req_id": "..." }.
 
-Keeps polling via GET /{path}?req_id={req_id} until status is "success" or "fail".`,
+Keeps polling via GET /{path}?req_id={req_id} until status is "success" or "fail", or until max_attempts / the time budget (about 50 s) runs out. If the query is still running the response is still "partial" and includes next_actions: call this tool again with the same arguments.`,
     inputSchema: z.object({
       path: z
         .string()
@@ -116,16 +120,7 @@ Keeps polling via GET /{path}?req_id={req_id} until status is "success" or "fail
         delay_ms?: number;
       };
 
-      let attempts = 0;
-      let result: Record<string, unknown> = { status: "partial", req_id };
-
-      while (result["status"] === "partial" && attempts < max_attempts) {
-        await new Promise((resolve) => setTimeout(resolve, delay_ms));
-        result = await client.get<Record<string, unknown>>(path, { req_id });
-        attempts++;
-      }
-
-      return result;
+      return client.pollReqId(path, req_id, { maxAttempts: max_attempts, delayMs: delay_ms });
     },
   },
 ];

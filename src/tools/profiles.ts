@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { CleverTapClient } from "../client.js";
+import { validateRange } from "../dates.js";
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, fetchCursorPage } from "./paging.js";
+
+const ymd = z.string().regex(/^\d{8}$/, "Use the YYYYMMDD format (e.g. '20240131')");
 
 export const profileTools = [
   {
@@ -88,37 +92,77 @@ export const profileTools = [
   {
     name: "clevertap_get_profiles_by_event",
     description:
-      "Get a list of user profiles who performed a specific event within a date range. Returns a cursor for paginated results — use clevertap_get_profiles_cursor to fetch subsequent pages.",
+      "Get the profiles of users who performed a specific event within a date range, one page at a time. Returns the first page of records plus next_cursor and next_actions: keep calling clevertap_get_profiles_cursor with next_cursor until it is absent (done: true). Profile cursors are valid for 4 days. Pass cursors exactly as returned.",
     inputSchema: z.object({
-      event_name: z.string().describe("Event name to filter profiles by"),
-      from: z.string().describe("Start date in YYYYMMDD format"),
-      to: z.string().describe("End date in YYYYMMDD format"),
+      event_name: z
+        .string()
+        .describe("Event name to filter profiles by. Exact and case-sensitive, e.g. 'App Launched'."),
+      from: ymd.describe("Start date in YYYYMMDD format. Not in the future."),
+      to: ymd.describe("End date in YYYYMMDD format. Not in the future."),
+      batch_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_PAGE_SIZE)
+        .optional()
+        .describe(
+          `Profiles per page (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Keep it small: each profile can be large.`
+        ),
+      fetch_first_page: z
+        .boolean()
+        .optional()
+        .describe(
+          "Default true: also return the first page of profiles. If false, only the cursor is returned and next_actions points to clevertap_get_profiles_cursor."
+        ),
     }),
     handler: async (client: CleverTapClient, args: unknown) => {
-      const { event_name, from, to } = args as {
+      const { event_name, from, to, batch_size, fetch_first_page } = args as {
         event_name: string;
         from: string;
         to: string;
+        batch_size?: number;
+        fetch_first_page?: boolean;
       };
-      return client.post("/profiles.json?batch_size=50", {
-        event_name,
-        from: parseInt(from),
-        to: parseInt(to),
-      });
+      validateRange(from, to, { noFuture: true });
+      const deadline = client.deadline();
+
+      const step1 = await client.post<{ cursor?: string }>(
+        "/profiles.json",
+        { event_name, from: parseInt(from), to: parseInt(to) },
+        { query: { batch_size: batch_size ?? DEFAULT_PAGE_SIZE }, timeoutMs: client.remaining(deadline), retryOn429: true }
+      );
+      const cursor = step1.cursor;
+      if (!cursor) return step1;
+
+      if (fetch_first_page === false) {
+        return {
+          ...step1,
+          next_actions: [
+            {
+              tool: "clevertap_get_profiles_cursor",
+              args: { cursor },
+              why: "Fetch the first page. Pass the cursor exactly as returned.",
+            },
+          ],
+        };
+      }
+      return fetchCursorPage(client, "/profiles.json", cursor, "clevertap_get_profiles_cursor", deadline);
     },
   },
   {
     name: "clevertap_get_profiles_cursor",
     description:
-      "Fetch the next page of user profiles using a cursor returned from clevertap_get_profiles_by_event.",
+      "Fetch the next page of user profiles using the cursor / next_cursor returned by clevertap_get_profiles_by_event or by a previous call to this tool. The response includes next_cursor and next_actions until the last page (done: true). If CleverTap is still preparing the page the call retries for you; if it still is not ready, repeat it with the same cursor. A cursor keeps its position and is valid for 4 days; do not share one cursor between parallel calls.",
     inputSchema: z.object({
       cursor: z
         .string()
-        .describe("Cursor string returned from a previous profiles query"),
+        .describe(
+          "Cursor exactly as returned (cursor or next_cursor). It is already percent-encoded: do not decode, edit or URL-encode it."
+        ),
     }),
     handler: async (client: CleverTapClient, args: unknown) => {
       const { cursor } = args as { cursor: string };
-      return client.get("/profiles.json", { cursor });
+      return fetchCursorPage(client, "/profiles.json", cursor, "clevertap_get_profiles_cursor");
     },
   },
   {
@@ -176,11 +220,11 @@ export const profileTools = [
   {
     name: "clevertap_get_profile_count",
     description:
-      "Get the count of user profiles who performed a specific event within a date range. Supports optional event property filters. Uses automatic async polling when the result is not immediately ready.",
+      "Get the count of user profiles who performed a specific event within a date range. Supports optional event property filters. Polls automatically while CleverTap computes the result; if it is not ready within the time budget the response has status 'partial' and next_actions pointing to clevertap_poll.",
     inputSchema: z.object({
       event_name: z.string().describe("Event name to filter profiles by"),
-      from: z.string().describe("Start date in YYYYMMDD format"),
-      to: z.string().describe("End date in YYYYMMDD format"),
+      from: ymd.describe("Start date in YYYYMMDD format"),
+      to: ymd.describe("End date in YYYYMMDD format"),
       event_properties: z
         .array(
           z.object({
@@ -215,6 +259,7 @@ export const profileTools = [
         to: parseInt(to),
       };
       if (event_properties) body.event_properties = event_properties;
+      validateRange(from, to);
       return client.postWithPolling("/counts/profiles.json", body);
     },
   },
