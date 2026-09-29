@@ -5,7 +5,7 @@ export const campaignTools = [
   {
     name: "clevertap_get_campaigns",
     description:
-      "List campaigns in CleverTap within a date range. Returns id, name, scheduled_on, and status for each campaign.",
+      "List the campaigns created through the CleverTap API (clevertap_create_campaign / the Target API) that are scheduled within a date range. Returns id, name, scheduled_on, and status for each campaign. Campaigns built in the dashboard are NOT listed here: an empty result does not mean the account has no campaigns. Use clevertap_get_message_report to see all campaigns and their metrics.",
     inputSchema: z.object({
       from: z.string().describe("Start date in YYYYMMDD format"),
       to: z.string().describe("End date in YYYYMMDD format"),
