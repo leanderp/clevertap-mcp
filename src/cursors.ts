@@ -9,6 +9,8 @@ const MAX_ENTRIES = 500;
 interface Entry {
   cursor: string;
   expiresAt: number;
+  /** Whether the caller asked for unredacted PII when the export started; later pages inherit it. */
+  includePii: boolean;
 }
 
 /**
@@ -26,16 +28,17 @@ export class CursorStore {
 
   constructor(private now: () => number = Date.now) {}
 
-  put(cursor: string): string {
+  put(cursor: string, includePii = false): string {
     this.prune();
     for (const [handle, entry] of this.entries) {
       if (entry.cursor === cursor) {
         entry.expiresAt = this.now() + TTL_MS;
+        entry.includePii = includePii;
         return handle;
       }
     }
     const handle = HANDLE_PREFIX + randomBytes(6).toString("hex");
-    this.entries.set(handle, { cursor, expiresAt: this.now() + TTL_MS });
+    this.entries.set(handle, { cursor, expiresAt: this.now() + TTL_MS, includePii });
     while (this.entries.size > MAX_ENTRIES) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
@@ -46,7 +49,12 @@ export class CursorStore {
 
   /** Turns a handle into the raw cursor; anything that is not a handle passes through. */
   resolve(value: string): string {
-    if (!value.startsWith(HANDLE_PREFIX)) return value;
+    return this.resolveEntry(value).cursor;
+  }
+
+  /** Like resolve(), plus the PII choice the export was started with (raw cursors: redacted). */
+  resolveEntry(value: string): { cursor: string; includePii: boolean } {
+    if (!value.startsWith(HANDLE_PREFIX)) return { cursor: value, includePii: false };
     const entry = this.entries.get(value);
     if (!entry || entry.expiresAt < this.now()) {
       throw new CleverTapToolError(`The cursor handle "${value}" is unknown or expired.`, {
@@ -56,7 +64,7 @@ export class CursorStore {
         ],
       });
     }
-    return entry.cursor;
+    return { cursor: entry.cursor, includePii: entry.includePii };
   }
 
   private prune(): void {
