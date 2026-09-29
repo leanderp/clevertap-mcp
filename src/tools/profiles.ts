@@ -92,7 +92,7 @@ export const profileTools = [
   {
     name: "clevertap_get_profiles_by_event",
     description:
-      "Get the profiles of users who performed a specific event within a date range, one page at a time. Returns the first page of records plus next_cursor and next_actions: keep calling clevertap_get_profiles_cursor with next_cursor until it is absent (done: true). Profile cursors are valid for 4 days. next_cursor is a short handle: pass it exactly as returned.",
+      "Get the profiles of users who performed a specific event within a date range, one page at a time. Returns the first page of records plus next_cursor and next_actions: keep calling clevertap_get_profiles_cursor with next_cursor until it is absent (done: true). Profile cursors are valid for 4 days. next_cursor is a short handle: pass it exactly as returned. Customer contact data (names, e-mails, phones, identities, push tokens) is redacted from every record unless include_pii is true.",
     inputSchema: z.object({
       event_name: z
         .string()
@@ -120,15 +120,22 @@ export const profileTools = [
         .describe(
           "Default false. If true, every record also carries the profile's lifetime event summary (about 75% of the record size). Only enable it if you need it and keep batch_size small."
         ),
+      include_pii: z
+        .boolean()
+        .optional()
+        .describe(
+          "Default false: names, e-mails, phones, identities, push tokens, birth dates and addresses are redacted from every record. Set true only if you really need the customers' contact data; the choice carries over to the next pages of this export. The server can force redaction (CLEVERTAP_REDACT_PII=always)."
+        ),
     }),
     handler: async (client: CleverTapClient, args: unknown) => {
-      const { event_name, from, to, batch_size, fetch_first_page, include_event_summary } = args as {
+      const { event_name, from, to, batch_size, fetch_first_page, include_event_summary, include_pii } = args as {
         event_name: string;
         from: string;
         to: string;
         batch_size?: number;
         fetch_first_page?: boolean;
         include_event_summary?: boolean;
+        include_pii?: boolean;
       };
       validateRange(from, to, { noFuture: true });
       const deadline = client.deadline();
@@ -142,9 +149,9 @@ export const profileTools = [
       if (!cursor) return step1;
 
       if (fetch_first_page === false) {
-        return cursorOnly(step1 as { cursor?: string } & Record<string, unknown>, "clevertap_get_profiles_cursor");
+        return cursorOnly(step1 as { cursor?: string } & Record<string, unknown>, "clevertap_get_profiles_cursor", include_pii === true);
       }
-      return startCursorPage(client, "/profiles.json", cursor, "clevertap_get_profiles_cursor", deadline);
+      return startCursorPage(client, "/profiles.json", cursor, "clevertap_get_profiles_cursor", { deadline, includePii: include_pii === true });
     },
   },
   {
