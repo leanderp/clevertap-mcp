@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { CleverTapClient } from "../client.js";
 import { validateRange } from "../dates.js";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, fetchCursorPage } from "./paging.js";
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, cursorOnly, exportQuery, fetchCursorPage, startCursorPage } from "./paging.js";
 
 const ymd = z.string().regex(/^\d{8}$/, "Use the YYYYMMDD format (e.g. '20240131')");
 
@@ -59,7 +59,7 @@ export const eventTools = [
   {
     name: "clevertap_get_events",
     description:
-      "Download the raw events of one event type within a date range, one page at a time. Returns the first page of records plus next_cursor and next_actions: keep calling clevertap_get_events_cursor with next_cursor until it is absent (done: true). Event cursors expire 4 hours after creation or after 1 hour of inactivity; if one expires, call this tool again. Pass cursors exactly as returned.",
+      "Download the raw events of one event type within a date range, one page at a time. Returns the first page of records plus next_cursor and next_actions: keep calling clevertap_get_events_cursor with next_cursor until it is absent (done: true). Event cursors expire 4 hours after creation or after 1 hour of inactivity; if one expires, call this tool again. next_cursor is a short handle: pass it exactly as returned.",
     inputSchema: z.object({
       event_name: z
         .string()
@@ -73,7 +73,7 @@ export const eventTools = [
         .max(MAX_PAGE_SIZE)
         .optional()
         .describe(
-          `Records per page (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Keep it small: each record can be large.`
+          `Records per page (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). CleverTap returns pages in multiples of 23 records and treats anything below 23 as unlimited, so values under 23 are raised to 23. Keep it small: a record is 0.4-6 KB and the page must fit in your context.`
         ),
       fetch_first_page: z
         .boolean()
@@ -81,14 +81,21 @@ export const eventTools = [
         .describe(
           "Default true: also return the first page of records. If false, only the cursor is returned and next_actions points to clevertap_get_events_cursor."
         ),
+      include_event_summary: z
+        .boolean()
+        .optional()
+        .describe(
+          "Default false. If true, every record also carries the profile's lifetime event summary (about 75% of the record size). Only enable it if you need it and keep batch_size small."
+        ),
     }),
     handler: async (client: CleverTapClient, args: unknown) => {
-      const { event_name, from, to, batch_size, fetch_first_page } = args as {
+      const { event_name, from, to, batch_size, fetch_first_page, include_event_summary } = args as {
         event_name: string;
         from: string;
         to: string;
         batch_size?: number;
         fetch_first_page?: boolean;
+        include_event_summary?: boolean;
       };
       validateRange(from, to, { noFuture: true });
       const deadline = client.deadline();
@@ -96,24 +103,15 @@ export const eventTools = [
       const step1 = await client.post<{ cursor?: string }>(
         "/events.json",
         { event_name, from: parseInt(from), to: parseInt(to) },
-        { query: { batch_size: batch_size ?? DEFAULT_PAGE_SIZE }, timeoutMs: client.remaining(deadline), retryOn429: true }
+        { query: exportQuery(batch_size, include_event_summary), timeoutMs: client.remaining(deadline), retryOn429: true }
       );
       const cursor = step1.cursor;
       if (!cursor) return step1;
 
       if (fetch_first_page === false) {
-        return {
-          ...step1,
-          next_actions: [
-            {
-              tool: "clevertap_get_events_cursor",
-              args: { cursor },
-              why: "Fetch the first page. Pass the cursor exactly as returned.",
-            },
-          ],
-        };
+        return cursorOnly(step1 as { cursor?: string } & Record<string, unknown>, "clevertap_get_events_cursor");
       }
-      return fetchCursorPage(client, "/events.json", cursor, "clevertap_get_events_cursor", deadline);
+      return startCursorPage(client, "/events.json", cursor, "clevertap_get_events_cursor", deadline);
     },
   },
   {
@@ -124,7 +122,7 @@ export const eventTools = [
       cursor: z
         .string()
         .describe(
-          "Cursor exactly as returned (cursor or next_cursor). It is already percent-encoded: do not decode, edit or URL-encode it."
+          "The cursor handle exactly as returned in next_cursor (a short value such as cur_1a2b3c4d5e6f). Do not edit it. If it is unknown or expired, restart the export."
         ),
     }),
     handler: async (client: CleverTapClient, args: unknown) => {

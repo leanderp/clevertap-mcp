@@ -157,12 +157,16 @@ test("get_events returns the first page and the call that fetches the next one",
   );
   const page = await callTool(eventTools, "clevertap_get_events", eventArgs, makeClient());
 
-  assert.match(mock.calls[0].url, /\/events\.json\?batch_size=25$/);
+  // Small pages and no per-profile event summary by default: they are what keeps a page in context.
+  assert.match(mock.calls[0].url, /\/events\.json\?batch_size=23&events=false$/);
   assert.equal(mock.calls[1].url, "https://us1.api.clevertap.com/1/events.json?cursor=CUR%2F1");
   assert.equal(page.records_count, 1);
   assert.equal(page.done, false);
-  assert.deepEqual(page.next_actions[0].args, { cursor: "NEXT%2F2" });
+  // The long CleverTap cursor never reaches the caller: it gets a short handle.
+  assert.match(page.next_cursor, /^cur_[0-9a-f]{12}$/);
+  assert.deepEqual(page.next_actions[0].args, { cursor: page.next_cursor });
   assert.equal(page.next_actions[0].tool, "clevertap_get_events_cursor");
+  assert.doesNotMatch(JSON.stringify(page), /NEXT%2F2/);
 });
 
 test("get_events marks the last page as done, also for an empty range", async () => {
@@ -180,6 +184,8 @@ test("get_events can return only the cursor", async () => {
   const result = await callTool(eventTools, "clevertap_get_events", { ...eventArgs, fetch_first_page: false }, makeClient());
   assert.equal(mock.calls.length, 1);
   assert.equal(result.next_actions[0].tool, "clevertap_get_events_cursor");
+  assert.match(result.cursor, /^cur_[0-9a-f]{12}$/);
+  assert.deepEqual(result.next_actions[0].args, { cursor: result.cursor });
 });
 
 test("get_events validates dates before calling the API and ignores the removed groups option", async () => {
