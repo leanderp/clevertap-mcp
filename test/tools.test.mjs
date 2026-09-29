@@ -283,3 +283,10 @@ test("formatError never echoes the records CleverTap rejected (they carry PII)",
   assert.match(text, /"unprocessed_count":1/);
   assert.match(text, /Event name mandatory/);
 });
+
+test("the version announced by the server matches package.json", async () => {
+  const { readFileSync } = await import("node:fs");
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+  assert.match(source, new RegExp(`version: "${pkg.version.replace(/\./g, "\\.")}"`));
+});
