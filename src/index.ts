@@ -111,7 +111,7 @@ const defaultProject = projectNames[0];
 // --- Server ---
 const server = new McpServer({
   name: "clevertap-mcp",
-  version: "1.0.0",
+  version: "1.2.0",
 });
 
 const allTools = [...eventTools, ...profileTools, ...campaignTools, ...reportTools, ...genericTools];
