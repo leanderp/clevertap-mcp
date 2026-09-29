@@ -9,6 +9,8 @@ import { campaignTools } from "./tools/campaigns.js";
 import { reportTools } from "./tools/reports.js";
 import { genericTools } from "./tools/generic.js";
 import { formatError } from "./errors.js";
+import { resolveProject } from "./projects.js";
+import { serializeResult } from "./output.js";
 // import { webTools, webSessions } from "./tools/web.js"; // TODO: next version
 
 // Tools that only read data. They are announced with readOnlyHint so MCP clients can
@@ -111,7 +113,7 @@ const defaultProject = projectNames[0];
 // --- Server ---
 const server = new McpServer({
   name: "clevertap-mcp",
-  version: "1.2.0",
+  version: "1.2.1",
 });
 
 const allTools = [...eventTools, ...profileTools, ...campaignTools, ...reportTools, ...genericTools];
@@ -295,30 +297,29 @@ if (clients.size === 0) {
   for (const tool of allTools) {
     // Extend every tool's schema with an optional `project` field
     const extendedSchema = tool.inputSchema.extend({
+      // A free string, not an enum of names: the catalog of a shared connector is published
+      // from one discovery credential, so listing names here would send users of other
+      // profiles a name that is not theirs. Unknown names are handled by resolveProject.
       project: z
-        .enum(projectNames as [string, ...string[]])
+        .string()
         .optional()
         .describe(
-          `CleverTap project to use. Available: ${projectNames.join(", ")}. Defaults to "${defaultProject}".`
+          "Optional. Name of the CleverTap project to use. Omit it to use your default project; clevertap_list_projects shows the configured names."
         ),
     });
 
     const callback = async (args: unknown) => {
       const { project: projectArg, ...toolArgs } = args as Record<string, unknown> & { project?: string };
-      const projectName = projectArg ?? defaultProject;
-      const client = clients.get(projectName);
-
-      if (!client) {
-        return {
-          content: [{ type: "text" as const, text: `Error: Unknown project "${projectName}". Available: ${projectNames.join(", ")}` }],
-          isError: true,
-        };
-      }
 
       try {
+        const { client, note } = resolveProject(clients, projectArg, defaultProject);
         const result = await tool.handler(client, toolArgs);
+        const withNote =
+          note && typeof result === "object" && result !== null && !Array.isArray(result)
+            ? { ...(result as Record<string, unknown>), project_note: note }
+            : result;
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text" as const, text: serializeResult(withNote) }],
         };
       } catch (error) {
         return {

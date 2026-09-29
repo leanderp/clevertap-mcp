@@ -172,7 +172,7 @@ export class CleverTapClient {
   async getCursorPage(
     path: string,
     cursor: string,
-    opts: { deadline?: number; retryTool: string }
+    opts: { deadline?: number; retryTool: string; retryCursor?: string }
   ): Promise<Record<string, unknown>> {
     if (!/^[A-Za-z0-9%_\-.~+=/]+$/.test(cursor)) {
       throw new CleverTapToolError("The cursor contains characters that never appear in CleverTap cursors.", {
@@ -209,7 +209,7 @@ export class CleverTapClient {
           nextActions: [
             {
               tool: opts.retryTool,
-              args: { cursor },
+              args: { cursor: opts.retryCursor ?? cursor },
               why: "Retry the same page in a few seconds.",
             },
           ],
