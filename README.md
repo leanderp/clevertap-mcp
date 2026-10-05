@@ -94,6 +94,7 @@ Read-only tools are announced with the MCP `readOnlyHint` annotation. Only GET r
 ### Behaviour changes for existing clients
 
 - **1.2.2:** records from `clevertap_get_events` / `clevertap_get_profiles_by_event` no longer include names, e-mails, phones, identities, push tokens, birth dates or addresses unless the call passes `include_pii: true`.
+- **1.2.3:** when a call gets no HTTP answer, the error names the cause (`fetch failed (EAI_AGAIN)`) and the call is retried up to twice with back-off: always if the connection never opened (DNS or connect failure, so nothing reached CleverTap), and after a reset only for reads. Seen on the first call after a cold start in Cloud Run.
 
 - `clevertap_get_events` and `clevertap_get_profiles_by_event` now return the **first page of records** (plus `next_cursor`, `done`, `next_actions`) instead of only a `cursor`. Pass `fetch_first_page: false` for the old shape. Pages are 23 records by default (minimum 23, maximum 50), records omit the profile's event summary unless `include_event_summary: true`, and `next_cursor` is a short handle.
 - The `project` parameter of every tool is a free string, not an enum of names: a name that is not the account's is replaced by the only configured project (with a `project_note`), or is an error listing the valid names when there are several. Responses are compact JSON (no indentation).

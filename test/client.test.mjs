@@ -143,3 +143,97 @@ test("postWithPolling that runs out of time hands back a clevertap_poll next act
   assert.deepEqual(result.next_actions[0].args, { path: "/counts/events.json", req_id: "123" });
   assert.equal(result.next_actions[0].tool, "clevertap_poll");
 });
+
+/** What fetch throws when it gets no HTTP answer: "fetch failed" with the reason in cause. */
+function fetchFailed(cause) {
+  return new TypeError("fetch failed", cause === undefined ? undefined : { cause });
+}
+
+function errno(code) {
+  return Object.assign(new Error(code), { code });
+}
+
+test("retries a write when the connection never opened (nothing reached CleverTap)", async () => {
+  mock = mockFetch((_call, index) => {
+    if (index === 0) throw fetchFailed(errno("EAI_AGAIN"));
+    return json({ status: "success", processed: 1 });
+  });
+  const result = await makeClient().post("/upload", { d: [] });
+  assert.equal(result.processed, 1);
+  assert.equal(mock.calls.length, 2);
+});
+
+test("reads the errno inside an AggregateError (several addresses tried)", async () => {
+  mock = mockFetch((_call, index) => {
+    if (index === 0) {
+      throw fetchFailed(new AggregateError([errno("ECONNREFUSED"), errno("ENETUNREACH")], "connect failed"));
+    }
+    return json({ status: "success", count: 7 });
+  });
+  const result = await makeClient().post("/upload", { d: [] });
+  assert.equal(result.count, 7);
+  assert.equal(mock.calls.length, 2);
+});
+
+test("does not repeat a write after a reset (CleverTap may have received it)", async () => {
+  mock = mockFetch(() => {
+    throw fetchFailed(errno("ECONNRESET"));
+  });
+  const error = await makeClient().post("/upload", { d: [] }).catch((e) => e);
+  assert.ok(error instanceof CleverTapToolError);
+  assert.match(error.message, /Could not reach CleverTap \(POST \/upload\): fetch failed \(ECONNRESET\)/);
+  assert.ok(error.hints.some((h) => /check its effect/.test(h)));
+  assert.equal(mock.calls.length, 1);
+});
+
+test("repeats a read after a reset", async () => {
+  mock = mockFetch((_call, index) => {
+    if (index === 0) throw fetchFailed(errno("ECONNRESET"));
+    return json({ status: "success", count: 3 });
+  });
+  const result = await makeClient().post("/counts/profiles.json", {}, { retryOn429: true });
+  assert.equal(result.count, 3);
+  assert.equal(mock.calls.length, 2);
+});
+
+test("gives up after two network retries and names the cause", async () => {
+  mock = mockFetch(() => {
+    throw fetchFailed(errno("EAI_AGAIN"));
+  });
+  const error = await makeClient().get("/now.json").catch((e) => e);
+  assert.ok(error instanceof CleverTapToolError);
+  assert.equal(error.retryable, true);
+  assert.match(error.message, /\(GET \/now\.json\): fetch failed \(EAI_AGAIN\)/);
+  assert.ok(error.hints.some((h) => /3 times/.test(h)));
+  assert.equal(mock.calls.length, 3);
+});
+
+test("a write without a known cause is not repeated and the message stays readable", async () => {
+  mock = mockFetch(() => {
+    throw fetchFailed();
+  });
+  const error = await makeClient().post("/upload", { d: [] }).catch((e) => e);
+  assert.match(error.message, /\(POST \/upload\): fetch failed$/);
+  assert.equal(mock.calls.length, 1);
+});
+
+test("a write that failed after a retry still warns to check its effect", async () => {
+  mock = mockFetch((_call, index) => {
+    throw fetchFailed(errno(index === 0 ? "EAI_AGAIN" : "ECONNRESET"));
+  });
+  const error = await makeClient().post("/upload", { d: [] }).catch((e) => e);
+  assert.equal(mock.calls.length, 2);
+  assert.ok(error.hints.some((h) => /2 times/.test(h)));
+  assert.ok(error.hints.some((h) => /check its effect/.test(h)));
+});
+
+test("network retries stop when the request's time is used up", async () => {
+  mock = mockFetch(() => {
+    throw fetchFailed(errno("EAI_AGAIN"));
+  });
+  // 500 ms of time, 1 s of back-off: there is no room for a retry.
+  const client = makeClient({ backoffBaseMs: 1_000 });
+  const error = await client.get("/now.json", undefined, { timeoutMs: 500 }).catch((e) => e);
+  assert.match(error.message, /EAI_AGAIN/);
+  assert.equal(mock.calls.length, 1);
+});
