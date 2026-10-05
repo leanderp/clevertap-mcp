@@ -25,6 +25,22 @@ export const DEFAULT_BUDGET_MS = 50_000;
 const DEFAULT_POLL_DELAY_MS = 3_000;
 const DEFAULT_BACKOFF_BASE_MS = 1_000;
 const MAX_429_RETRIES = 2;
+/** Retries after a network-level failure (no HTTP answer at all). */
+const MAX_NETWORK_RETRIES = 2;
+/**
+ * Failures that happen before the request reaches CleverTap (name resolution or the
+ * TCP connect). Nothing was sent, so repeating the call is safe even for a write.
+ * Seen on a freshly started Cloud Run instance, where the first outbound call can
+ * fail while networking is still coming up.
+ */
+const PRE_CONNECT_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
 /** Time kept in reserve so the last request of a budget still has room to answer. */
 const RESERVE_MS = 1_000;
 
@@ -72,6 +88,35 @@ export function withPollHint(
     why: "CleverTap is still computing this query. Poll again in a few seconds.",
   };
   return { ...result, next_actions: [action] };
+}
+
+/**
+ * fetch() only says "fetch failed"; the reason is in error.cause (an errno such as
+ * EAI_AGAIN, or an undici code). With several addresses to try, cause is an
+ * AggregateError whose own code may be missing, so its first inner code is used.
+ */
+export function networkErrorCode(error: unknown): string | undefined {
+  const cause = (error as { cause?: unknown } | null)?.cause as
+    | { code?: unknown; errors?: unknown }
+    | undefined;
+  if (!cause || typeof cause !== "object") return undefined;
+  if (typeof cause.code === "string") return cause.code;
+  if (Array.isArray(cause.errors)) {
+    for (const inner of cause.errors) {
+      const code = (inner as { code?: unknown } | null)?.code;
+      if (typeof code === "string") return code;
+    }
+  }
+  return undefined;
+}
+
+class NetworkFailure extends Error {
+  constructor(
+    message: string,
+    readonly code: string | undefined
+  ) {
+    super(message);
+  }
 }
 
 export class CleverTapClient {
@@ -229,10 +274,38 @@ export class CleverTapClient {
     }
     const url = this.buildUrl(path, opts);
     const timeoutMs = Math.max(1, Math.min(opts.timeoutMs ?? this.timeoutMs, this.timeoutMs));
+    // Retries share the caller's time, they do not get a fresh timeout each.
+    const end = Date.now() + timeoutMs;
 
+    const mayRetry = method === "GET" || opts.retryOn429 === true;
+    let networkRetries = 0;
     for (let attempt = 0; ; attempt++) {
-      const response = await this.send(method, url, body, timeoutMs, path);
-      const mayRetry = method === "GET" || opts.retryOn429 === true;
+      let response: { status: number; text: string };
+      try {
+        response = await this.send(method, url, body, Math.max(1, end - Date.now()), path);
+      } catch (error) {
+        if (!(error instanceof NetworkFailure)) throw error;
+        // A reset after connecting may mean CleverTap got the request, so only reads
+        // (the same calls that may repeat on 429) are repeated in that case.
+        const safe = mayRetry || (error.code !== undefined && PRE_CONNECT_CODES.has(error.code));
+        const backoff = this.backoffBaseMs * 2 ** networkRetries;
+        const hasTime = end - Date.now() > backoff + RESERVE_MS;
+        if (safe && hasTime && networkRetries < MAX_NETWORK_RETRIES) {
+          await sleep(backoff);
+          networkRetries++;
+          continue;
+        }
+        const reason = error.code ? `${error.message} (${error.code})` : error.message;
+        throw new CleverTapToolError(`Could not reach CleverTap (${method} ${path}): ${reason}`, {
+          retryable: true,
+          hints: [
+            ...(networkRetries > 0
+              ? [`Failed ${networkRetries + 1} times in a row. Wait a few seconds before retrying.`]
+              : []),
+            ...(mayRetry ? [] : ["If the call modifies data, check its effect before repeating it."]),
+          ],
+        });
+      }
       if (response.status === 429 && mayRetry && attempt < MAX_429_RETRIES) {
         await sleep(this.backoffBaseMs * 2 ** attempt);
         continue;
@@ -284,9 +357,9 @@ export class CleverTapClient {
           }
         );
       }
-      throw new CleverTapToolError(
-        `Could not reach CleverTap (${method} ${path}): ${error instanceof Error ? error.message : String(error)}`,
-        { retryable: true }
+      throw new NetworkFailure(
+        error instanceof Error ? error.message : String(error),
+        networkErrorCode(error)
       );
     }
   }
